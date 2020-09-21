@@ -12,7 +12,7 @@ import torch.optim
 from torch.nn.utils import clip_grad_norm_
 
 from ops.dataset import TSNDataSet
-from ops.models import TSN
+from ops.models import TSN, VNet
 from ops.transforms import *
 from opts import parser
 from ops import dataset_config
@@ -63,6 +63,7 @@ def main():
                 fc_lr5=not (args.tune_from and args.dataset in args.tune_from),
                 temporal_pool=args.temporal_pool,
                 non_local=args.non_local)
+    vnet = VNet(1, 100, 1).cuda()
 
     crop_size = model.crop_size
     scale_size = model.scale_size
@@ -77,6 +78,9 @@ def main():
                                 args.lr,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
+    optimizer_vnet = torch.optim.Adam(vnet.params(),
+                                1e-3,
+                                weight_decay=1e-4)
 
     if args.resume:
         if args.temporal_pool:  # early temporal pool so that we can load the state_dict
@@ -191,7 +195,8 @@ def main():
         adjust_learning_rate(optimizer, epoch, args.lr_type, args.lr_steps)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, log_training, tf_writer)
+        # train(train_loader, model, criterion, optimizer, epoch, log_training, tf_writer)
+        v_train(train_loader, model, vnet, criterion, optimizer, optimizer_vnet, epoch, log_training, tf_writer)
 
         # evaluate on validation set
         if (epoch + 1) % args.eval_freq == 0 or epoch == args.epochs - 1:
@@ -214,6 +219,72 @@ def main():
                 'optimizer': optimizer.state_dict(),
                 'best_prec1': best_prec1,
             }, is_best)
+
+
+def v_train(train_loader, model, vnet, criterion, optimizer, optimizer_vnet, epoch, log, tf_writer):
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    losses = AverageMeter()
+    top1 = AverageMeter()
+    top5 = AverageMeter()
+
+    if args.no_partialbn:
+        model.module.partialBN(False)
+    else:
+        model.module.partialBN(True)
+
+    # switch to train mode
+    model.train()
+
+    end = time.time()
+    for i, (input, target) in enumerate(train_loader):
+        # measure data loading time
+        data_time.update(time.time() - end)
+
+        target = target.cuda()
+        input_var = torch.autograd.Variable(input)
+        target_var = torch.autograd.Variable(target)
+
+        # compute output
+        output = model(input_var)
+        loss = criterion(output, target_var)
+
+        # measure accuracy and record loss
+        prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
+        losses.update(loss.item(), input.size(0))
+        top1.update(prec1.item(), input.size(0))
+        top5.update(prec5.item(), input.size(0))
+
+        # compute gradient and do SGD step
+        loss.backward()
+
+        if args.clip_gradient is not None:
+            total_norm = clip_grad_norm_(model.parameters(), args.clip_gradient)
+
+        optimizer.step()
+        optimizer.zero_grad()
+
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        if i % args.print_freq == 0:
+            output = ('Epoch: [{0}][{1}/{2}], lr: {lr:.5f}\t'
+                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                      'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                      'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
+                      'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
+                epoch, i, len(train_loader), batch_time=batch_time,
+                data_time=data_time, loss=losses, top1=top1, top5=top5, lr=optimizer.param_groups[-1]['lr'] * 0.1))  # TODO
+            print(output)
+            log.write(output + '\n')
+            log.flush()
+
+    tf_writer.add_scalar('loss/train', losses.avg, epoch)
+    tf_writer.add_scalar('acc/train_top1', top1.avg, epoch)
+    tf_writer.add_scalar('acc/train_top5', top5.avg, epoch)
+    tf_writer.add_scalar('lr', optimizer.param_groups[-1]['lr'], epoch)
 
 
 def train(train_loader, model, criterion, optimizer, epoch, log, tf_writer):
