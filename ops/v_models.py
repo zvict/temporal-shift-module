@@ -123,7 +123,7 @@ class MetaLinear(MetaModule):
         return [('weight', self.weight), ('bias', self.bias)]
 
 
-class v_TSN(nn.Module):
+class v_TSN(MetaModule):
     def __init__(self, num_class, num_segments, modality,
                  base_model='resnet101', new_length=None,
                  consensus_type='avg', before_softmax=True,

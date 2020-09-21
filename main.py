@@ -12,7 +12,8 @@ import torch.optim
 from torch.nn.utils import clip_grad_norm_
 
 from ops.dataset import TSNDataSet
-from ops.models import TSN, VNet
+from ops.models import TSN
+from ops.v_models import VNet, v_TSN
 from ops.transforms import *
 from opts import parser
 from ops import dataset_config
@@ -22,7 +23,7 @@ from ops.temporal_shift import make_temporal_pool
 from tensorboardX import SummaryWriter
 
 best_prec1 = 0
-
+args = None
 
 def main():
     global args, best_prec1
@@ -32,7 +33,8 @@ def main():
                                                                                                       args.modality)
     full_arch_name = args.arch
     if args.shift:
-        full_arch_name += '_shift{}_{}'.format(args.shift_div, args.shift_place)
+        full_arch_name += '_shift{}_{}'.format(
+            args.shift_div, args.shift_place)
     if args.temporal_pool:
         full_arch_name += '_tpool'
     args.store_name = '_'.join(
@@ -63,6 +65,18 @@ def main():
                 fc_lr5=not (args.tune_from and args.dataset in args.tune_from),
                 temporal_pool=args.temporal_pool,
                 non_local=args.non_local)
+    v_model = v_TSN(num_class, args.num_segments, args.modality,
+                  base_model=args.arch,
+                  consensus_type=args.consensus_type,
+                  dropout=args.dropout,
+                  img_feature_dim=args.img_feature_dim,
+                  partial_bn=not args.no_partialbn,
+                  pretrain=args.pretrain,
+                  is_shift=args.shift, shift_div=args.shift_div, shift_place=args.shift_place,
+                  fc_lr5=not (
+                      args.tune_from and args.dataset in args.tune_from),
+                  temporal_pool=args.temporal_pool,
+                  non_local=args.non_local)
     vnet = VNet(1, 100, 1).cuda()
 
     crop_size = model.crop_size
@@ -70,7 +84,9 @@ def main():
     input_mean = model.input_mean
     input_std = model.input_std
     policies = model.get_optim_policies()
-    train_augmentation = model.get_augmentation(flip=False if 'something' in args.dataset or 'jester' in args.dataset else True)
+    v_policies = v_model.get_optim_policies()
+    train_augmentation = model.get_augmentation(
+        flip=False if 'something' in args.dataset or 'jester' in args.dataset else True)
 
     model = torch.nn.DataParallel(model, device_ids=args.gpus).cuda()
 
@@ -78,9 +94,13 @@ def main():
                                 args.lr,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
+    v_optimizer = torch.optim.SGD(v_policies,
+                                  args.lr,
+                                  momentum=args.momentum,
+                                  weight_decay=args.weight_decay)
     optimizer_vnet = torch.optim.Adam(vnet.params(),
-                                1e-3,
-                                weight_decay=1e-4)
+                                      1e-3,
+                                      weight_decay=1e-4)
 
     if args.resume:
         if args.temporal_pool:  # early temporal pool so that we can load the state_dict
@@ -128,6 +148,7 @@ def main():
 
     if args.temporal_pool and not args.resume:
         make_temporal_pool(model.module.base_model, args.num_segments)
+        make_temporal_pool(v_model.module.base_model, args.num_segments)
 
     cudnn.benchmark = True
 
@@ -149,8 +170,10 @@ def main():
                    image_tmpl=prefix,
                    transform=torchvision.transforms.Compose([
                        train_augmentation,
-                       Stack(roll=(args.arch in ['BNInception', 'InceptionV3'])),
-                       ToTorchFormatTensor(div=(args.arch not in ['BNInception', 'InceptionV3'])),
+                       Stack(
+                           roll=(args.arch in ['BNInception', 'InceptionV3'])),
+                       ToTorchFormatTensor(
+                           div=(args.arch not in ['BNInception', 'InceptionV3'])),
                        normalize,
                    ]), dense_sample=args.dense_sample),
         batch_size=args.batch_size, shuffle=True,
@@ -166,8 +189,10 @@ def main():
                    transform=torchvision.transforms.Compose([
                        GroupScale(int(scale_size)),
                        GroupCenterCrop(crop_size),
-                       Stack(roll=(args.arch in ['BNInception', 'InceptionV3'])),
-                       ToTorchFormatTensor(div=(args.arch not in ['BNInception', 'InceptionV3'])),
+                       Stack(
+                           roll=(args.arch in ['BNInception', 'InceptionV3'])),
+                       ToTorchFormatTensor(
+                           div=(args.arch not in ['BNInception', 'InceptionV3'])),
                        normalize,
                    ]), dense_sample=args.dense_sample),
         batch_size=args.batch_size, shuffle=False,
@@ -176,6 +201,7 @@ def main():
     # define loss function (criterion) and optimizer
     if args.loss_type == 'nll':
         criterion = torch.nn.CrossEntropyLoss().cuda()
+        valcriterion = torch.nn.CrossEntropyLoss().cuda()
     else:
         raise ValueError("Unknown loss type")
 
@@ -187,20 +213,27 @@ def main():
         validate(val_loader, model, criterion, 0)
         return
 
-    log_training = open(os.path.join(args.root_log, args.store_name, 'log.csv'), 'w')
+    log_training = open(os.path.join(
+        args.root_log, args.store_name, 'log.csv'), 'w')
     with open(os.path.join(args.root_log, args.store_name, 'args.txt'), 'w') as f:
         f.write(str(args))
-    tf_writer = SummaryWriter(log_dir=os.path.join(args.root_log, args.store_name))
+    tf_writer = SummaryWriter(
+        log_dir=os.path.join(args.root_log, args.store_name))
     for epoch in range(args.start_epoch, args.epochs):
         adjust_learning_rate(optimizer, epoch, args.lr_type, args.lr_steps)
 
         # train for one epoch
         # train(train_loader, model, criterion, optimizer, epoch, log_training, tf_writer)
-        v_train(train_loader, model, vnet, criterion, optimizer, optimizer_vnet, epoch, log_training, tf_writer)
+        v_train(train_loader, val_loader,
+                model, v_model, vnet,
+                criterion, valcriterion,
+                optimizer, v_optimizer, optimizer_vnet,
+                epoch, log_training, tf_writer)
 
         # evaluate on validation set
         if (epoch + 1) % args.eval_freq == 0 or epoch == args.epochs - 1:
-            prec1 = validate(val_loader, model, criterion, epoch, log_training, tf_writer)
+            prec1 = validate(val_loader, model, criterion,
+                             epoch, log_training, tf_writer)
 
             # remember best prec@1 and save checkpoint
             is_best = prec1 > best_prec1
@@ -221,12 +254,18 @@ def main():
             }, is_best)
 
 
-def v_train(train_loader, model, vnet, criterion, optimizer, optimizer_vnet, epoch, log, tf_writer):
+def v_train(train_loader, val_loader,
+            model, v_model, vnet,
+            criterion, valcriterion,
+            optimizer, v_optimizer, optimizer_vnet,
+            epoch, log, tf_writer):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
     top5 = AverageMeter()
+
+    val_loader_iter = iter(val_loader)
 
     if args.no_partialbn:
         model.module.partialBN(False)
@@ -241,13 +280,50 @@ def v_train(train_loader, model, vnet, criterion, optimizer, optimizer_vnet, epo
         # measure data loading time
         data_time.update(time.time() - end)
 
+        v_model.load_state_dict(model.state_dict())
+
         target = target.cuda()
         input_var = torch.autograd.Variable(input)
         target_var = torch.autograd.Variable(target)
 
         # compute output
+        output = v_model(input_var)
+        # loss = criterion(output, target_var)
+        cost = criterion(output, target_var)
+        cost_v = torch.reshape(cost, (-1, 1))
+        v_lambda = vnet(cost_v.data)
+        l_f_v = torch.sum(cost_v * v_lambda) / len(cost_v)
+        v_model.zero_grad()
+        grads = torch.autograd.grad(l_f_v, (v_model.params()), create_graph=True)
+        # to be modified
+        v_lr = args.lr * ((0.1 ** int(epoch >= 80)) * (0.1 ** int(epoch >= 100)))
+        v_model.update_params(lr_inner=v_lr, source_params=grads)
+        del grads
+
+        # phase 2. pixel weights step
+        try:
+            sample_val = next(val_loader_iter)  # 拿一个val set图片
+        except StopIteration:
+            val_loader_iter = iter(val_loader)
+            sample_val = next(val_loader_iter)
+        inputs_val, targets_val = sample_val['image'], sample_val['label']
+        inputs_val, targets_val = inputs_val.cuda(), targets_val.cuda()
+        y_g_hat = v_model(inputs_val)
+        l_g_meta = valcriterion(y_g_hat, targets_val)  # val loss
+        optimizer_vnet.zero_grad()
+        l_g_meta.backward()
+        optimizer_vnet.step()
+
+        # phase 1. network weight step (w)
         output = model(input_var)
-        loss = criterion(output, target_var)
+        cost = criterion(output, target)
+        cost_v = torch.reshape(cost, (-1, 1))
+        with torch.no_grad():
+            v_new = vnet(cost_v)
+        loss = torch.sum(cost_v * v_new) / len(cost_v)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
         # measure accuracy and record loss
         prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
@@ -256,13 +332,14 @@ def v_train(train_loader, model, vnet, criterion, optimizer, optimizer_vnet, epo
         top5.update(prec5.item(), input.size(0))
 
         # compute gradient and do SGD step
-        loss.backward()
+        # loss.backward()
 
         if args.clip_gradient is not None:
-            total_norm = clip_grad_norm_(model.parameters(), args.clip_gradient)
+            total_norm = clip_grad_norm_(
+                model.parameters(), args.clip_gradient)
 
-        optimizer.step()
-        optimizer.zero_grad()
+        # optimizer.step()
+        # optimizer.zero_grad()
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -275,8 +352,8 @@ def v_train(train_loader, model, vnet, criterion, optimizer, optimizer_vnet, epo
                       'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
                       'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
                       'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
-                epoch, i, len(train_loader), batch_time=batch_time,
-                data_time=data_time, loss=losses, top1=top1, top5=top5, lr=optimizer.param_groups[-1]['lr'] * 0.1))  # TODO
+                          epoch, i, len(train_loader), batch_time=batch_time,
+                          data_time=data_time, loss=losses, top1=top1, top5=top5, lr=optimizer.param_groups[-1]['lr'] * 0.1))  # TODO
             print(output)
             log.write(output + '\n')
             log.flush()
@@ -325,7 +402,8 @@ def train(train_loader, model, criterion, optimizer, epoch, log, tf_writer):
         loss.backward()
 
         if args.clip_gradient is not None:
-            total_norm = clip_grad_norm_(model.parameters(), args.clip_gradient)
+            total_norm = clip_grad_norm_(
+                model.parameters(), args.clip_gradient)
 
         optimizer.step()
         optimizer.zero_grad()
@@ -341,8 +419,8 @@ def train(train_loader, model, criterion, optimizer, epoch, log, tf_writer):
                       'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
                       'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
                       'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
-                epoch, i, len(train_loader), batch_time=batch_time,
-                data_time=data_time, loss=losses, top1=top1, top5=top5, lr=optimizer.param_groups[-1]['lr'] * 0.1))  # TODO
+                          epoch, i, len(train_loader), batch_time=batch_time,
+                          data_time=data_time, loss=losses, top1=top1, top5=top5, lr=optimizer.param_groups[-1]['lr'] * 0.1))  # TODO
             print(output)
             log.write(output + '\n')
             log.flush()
@@ -388,8 +466,8 @@ def validate(val_loader, model, criterion, epoch, log=None, tf_writer=None):
                           'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
                           'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
                           'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
-                    i, len(val_loader), batch_time=batch_time, loss=losses,
-                    top1=top1, top5=top5))
+                              i, len(val_loader), batch_time=batch_time, loss=losses,
+                              top1=top1, top5=top5))
                 print(output)
                 if log is not None:
                     log.write(output + '\n')
