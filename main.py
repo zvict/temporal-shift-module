@@ -27,6 +27,7 @@ args = None
 
 def main():
     global args, best_prec1
+    print("parsing args ...")
     args = parser.parse_args()
 
     num_class, args.train_list, args.val_list, args.root_path, prefix = dataset_config.return_dataset(args.dataset,
@@ -52,8 +53,10 @@ def main():
         args.store_name += '_{}'.format(args.suffix)
     print('storing name: ' + args.store_name)
 
+    print("checking root folders ...")
     check_rootfolders()
 
+    print("building models ...")
     model = TSN(num_class, args.num_segments, args.modality,
                 base_model=args.arch,
                 consensus_type=args.consensus_type,
@@ -79,6 +82,7 @@ def main():
                   non_local=args.non_local)
     vnet = VNet(1, 100, 1).cuda()
 
+    print("getting sizes ...")
     crop_size = model.crop_size
     scale_size = model.scale_size
     input_mean = model.input_mean
@@ -88,8 +92,11 @@ def main():
     train_augmentation = model.get_augmentation(
         flip=False if 'something' in args.dataset or 'jester' in args.dataset else True)
 
+    print("model paralleling ...")
     model = torch.nn.DataParallel(model, device_ids=args.gpus).cuda()
+    v_model = torch.nn.DataParallel(v_model, device_ids=args.gpus).cuda()
 
+    print("building optimizers ...")
     optimizer = torch.optim.SGD(policies,
                                 args.lr,
                                 momentum=args.momentum,
@@ -103,6 +110,7 @@ def main():
                                       weight_decay=1e-4)
 
     if args.resume:
+        print("resuming ...")
         if args.temporal_pool:  # early temporal pool so that we can load the state_dict
             make_temporal_pool(model.module.base_model, args.num_segments)
         if os.path.isfile(args.resume):
@@ -153,6 +161,7 @@ def main():
     cudnn.benchmark = True
 
     # Data loading code
+    print("loading data ...")
     if args.modality != 'RGBDiff':
         normalize = GroupNormalize(input_mean, input_std)
     else:
@@ -199,6 +208,7 @@ def main():
         num_workers=args.workers, pin_memory=True)
 
     # define loss function (criterion) and optimizer
+    print("defining loss and optimizer ...")
     if args.loss_type == 'nll':
         criterion = torch.nn.CrossEntropyLoss().cuda()
         valcriterion = torch.nn.CrossEntropyLoss().cuda()
@@ -219,6 +229,8 @@ def main():
         f.write(str(args))
     tf_writer = SummaryWriter(
         log_dir=os.path.join(args.root_log, args.store_name))
+
+    print("start training ...")
     for epoch in range(args.start_epoch, args.epochs):
         adjust_learning_rate(optimizer, epoch, args.lr_type, args.lr_steps)
 
@@ -294,19 +306,19 @@ def v_train(train_loader, val_loader,
         v_lambda = vnet(cost_v.data)
         l_f_v = torch.sum(cost_v * v_lambda) / len(cost_v)
         v_model.zero_grad()
-        grads = torch.autograd.grad(l_f_v, (v_model.params()), create_graph=True)
+        grads = torch.autograd.grad(l_f_v, (v_model.module.params()), create_graph=True)
         # to be modified
         v_lr = args.lr * ((0.1 ** int(epoch >= 80)) * (0.1 ** int(epoch >= 100)))
-        v_model.update_params(lr_inner=v_lr, source_params=grads)
+        v_model.module.update_params(lr_inner=v_lr, source_params=grads)
         del grads
 
         # phase 2. pixel weights step
         try:
-            sample_val = next(val_loader_iter)  # 拿一个val set图片
+            inputs_val, targets_val = next(val_loader_iter)  # 拿一个val set图片
         except StopIteration:
             val_loader_iter = iter(val_loader)
-            sample_val = next(val_loader_iter)
-        inputs_val, targets_val = sample_val['image'], sample_val['label']
+            inputs_val, targets_val = next(val_loader_iter)
+        # inputs_val, targets_val = sample_val['image'], sample_val['label']
         inputs_val, targets_val = inputs_val.cuda(), targets_val.cuda()
         y_g_hat = v_model(inputs_val)
         l_g_meta = valcriterion(y_g_hat, targets_val)  # val loss

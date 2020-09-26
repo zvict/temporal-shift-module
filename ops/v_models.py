@@ -79,7 +79,7 @@ class MetaModule(nn.Module):
                     self.set_param(mod, rest, param)
                     break
         else:
-            setattr(curr_mod, name, param)
+            setattr(curr_mod, name, nn.Parameter(param))
 
     def detach_params(self):
         for name, param in self.named_params(self):
@@ -131,7 +131,7 @@ class v_TSN(MetaModule):
                  crop_num=1, partial_bn=True, print_spec=True, pretrain='imagenet',
                  is_shift=False, shift_div=8, shift_place='blockres', fc_lr5=False,
                  temporal_pool=False, non_local=False):
-        super(TSN, self).__init__()
+        super(v_TSN, self).__init__()
         self.modality = modality
         self.num_segments = num_segments
         self.reshape = True
