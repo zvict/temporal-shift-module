@@ -291,9 +291,9 @@ def v_train(train_loader, val_loader,
         v_lambda = vnet(cost_v.data)
         l_f_v = torch.sum(cost_v * v_lambda) / len(cost_v)
         vnet.zero_grad()
-        grads = torch.autograd.grad(l_f_v, (vnet.module.params()), create_graph=True)
+        grads = torch.autograd.grad(l_f_v, (vnet.params()), create_graph=True)
         v_lr = args.lr * ((0.1 ** int(epoch >= 80)) * (0.1 ** int(epoch >= 100)))
-        vnet.module.update_params(lr_inner=v_lr, source_params=grads)
+        vnet.update_params(lr_inner=v_lr, source_params=grads)
         del grads
 
         # phase 1. network weight step (w)
