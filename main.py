@@ -87,10 +87,6 @@ def main():
                                 args.lr,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
-    v_optimizer = torch.optim.SGD(v_policies,
-                                  args.lr,
-                                  momentum=args.momentum,
-                                  weight_decay=args.weight_decay)
     optimizer_vnet = torch.optim.Adam(vnet.params(),
                                       1e-3,
                                       weight_decay=1e-4)
@@ -224,7 +220,7 @@ def main():
         v_train(train_loader, val_loader,
                 model, vnet,
                 criterion, valcriterion,
-                optimizer, v_optimizer, optimizer_vnet,
+                optimizer, optimizer_vnet,
                 epoch, log_training, tf_writer)
 
         # evaluate on validation set
@@ -254,7 +250,7 @@ def main():
 def v_train(train_loader, val_loader,
             model, vnet,
             criterion, valcriterion,
-            optimizer, v_optimizer, optimizer_vnet,
+            optimizer, optimizer_vnet,
             epoch, log, tf_writer):
     batch_time = AverageMeter()
     data_time = AverageMeter()
