@@ -13,7 +13,7 @@ from torch.nn.utils import clip_grad_norm_
 
 from ops.dataset import TSNDataSet
 from ops.models import TSN
-from ops.v_models import VNet, v_TSN
+from ops.v_models import VNet
 from ops.transforms import *
 from opts import parser
 from ops import dataset_config
@@ -68,18 +68,6 @@ def main():
                 fc_lr5=not (args.tune_from and args.dataset in args.tune_from),
                 temporal_pool=args.temporal_pool,
                 non_local=args.non_local)
-    v_model = v_TSN(num_class, args.num_segments, args.modality,
-                  base_model=args.arch,
-                  consensus_type=args.consensus_type,
-                  dropout=args.dropout,
-                  img_feature_dim=args.img_feature_dim,
-                  partial_bn=not args.no_partialbn,
-                  pretrain=args.pretrain,
-                  is_shift=args.shift, shift_div=args.shift_div, shift_place=args.shift_place,
-                  fc_lr5=not (
-                      args.tune_from and args.dataset in args.tune_from),
-                  temporal_pool=args.temporal_pool,
-                  non_local=args.non_local)
     vnet = VNet(1, 100, 1).cuda()
 
     print("getting sizes ...")
@@ -88,13 +76,11 @@ def main():
     input_mean = model.input_mean
     input_std = model.input_std
     policies = model.get_optim_policies()
-    v_policies = v_model.get_optim_policies()
     train_augmentation = model.get_augmentation(
         flip=False if 'something' in args.dataset or 'jester' in args.dataset else True)
 
     print("model paralleling ...")
     model = torch.nn.DataParallel(model, device_ids=args.gpus).cuda()
-    v_model = torch.nn.DataParallel(v_model, device_ids=args.gpus).cuda()
 
     print("building optimizers ...")
     optimizer = torch.optim.SGD(policies,
@@ -156,7 +142,6 @@ def main():
 
     if args.temporal_pool and not args.resume:
         make_temporal_pool(model.module.base_model, args.num_segments)
-        make_temporal_pool(v_model.module.base_model, args.num_segments)
 
     cudnn.benchmark = True
 
@@ -237,7 +222,7 @@ def main():
         # train for one epoch
         # train(train_loader, model, criterion, optimizer, epoch, log_training, tf_writer)
         v_train(train_loader, val_loader,
-                model, v_model, vnet,
+                model, vnet,
                 criterion, valcriterion,
                 optimizer, v_optimizer, optimizer_vnet,
                 epoch, log_training, tf_writer)
@@ -267,7 +252,7 @@ def main():
 
 
 def v_train(train_loader, val_loader,
-            model, v_model, vnet,
+            model, vnet,
             criterion, valcriterion,
             optimizer, v_optimizer, optimizer_vnet,
             epoch, log, tf_writer):
@@ -292,25 +277,9 @@ def v_train(train_loader, val_loader,
         # measure data loading time
         data_time.update(time.time() - end)
 
-        v_model.load_state_dict(model.state_dict())
-
         target = target.cuda()
         input_var = torch.autograd.Variable(input)
         target_var = torch.autograd.Variable(target)
-
-        # compute output
-        output = v_model(input_var)
-        # loss = criterion(output, target_var)
-        cost = criterion(output, target_var)
-        cost_v = torch.reshape(cost, (-1, 1))
-        v_lambda = vnet(cost_v.data)
-        l_f_v = torch.sum(cost_v * v_lambda) / len(cost_v)
-        v_model.zero_grad()
-        grads = torch.autograd.grad(l_f_v, (v_model.module.params()), create_graph=True)
-        # to be modified
-        v_lr = args.lr * ((0.1 ** int(epoch >= 80)) * (0.1 ** int(epoch >= 100)))
-        v_model.module.update_params(lr_inner=v_lr, source_params=grads)
-        del grads
 
         # phase 2. pixel weights step
         try:
@@ -320,11 +289,16 @@ def v_train(train_loader, val_loader,
             inputs_val, targets_val = next(val_loader_iter)
         # inputs_val, targets_val = sample_val['image'], sample_val['label']
         inputs_val, targets_val = inputs_val.cuda(), targets_val.cuda()
-        y_g_hat = v_model(inputs_val)
-        l_g_meta = valcriterion(y_g_hat, targets_val)  # val loss
-        optimizer_vnet.zero_grad()
-        l_g_meta.backward()
-        optimizer_vnet.step()
+        y_g_hat = model(inputs_val)
+        cost = valcriterion(y_g_hat, targets_val)  # val loss
+        cost_v = torch.reshape(cost, (-1, 1))
+        v_lambda = vnet(cost_v.data)
+        l_f_v = torch.sum(cost_v * v_lambda) / len(cost_v)
+        vnet.zero_grad()
+        grads = torch.autograd.grad(l_f_v, (vnet.module.params()), create_graph=True)
+        v_lr = args.lr * ((0.1 ** int(epoch >= 80)) * (0.1 ** int(epoch >= 100)))
+        vnet.module.update_params(lr_inner=v_lr, source_params=grads)
+        del grads
 
         # phase 1. network weight step (w)
         output = model(input_var)
