@@ -6,6 +6,8 @@ from ops.basic_ops import ConsensusModule
 from ops.transforms import *
 from torch.nn.init import normal_, constant_
 
+# vnet at line 97, v_TSN(v_model) at line 129, for v_TSN only changed name and parent class
+
 def to_var(x, requires_grad=True):
     if torch.cuda.is_available():
         x = x.cuda()
@@ -107,6 +109,7 @@ class VNet(MetaModule):
         # x = self.relu1(x)
         out = self.linear2(x)
         return F.sigmoid(out)
+
 
 class MetaLinear(MetaModule):
     def __init__(self, *args, **kwargs):

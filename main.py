@@ -13,7 +13,7 @@ from torch.nn.utils import clip_grad_norm_
 
 from ops.dataset import TSNDataSet
 from ops.models import TSN
-from ops.v_models import VNet, v_TSN
+from ops.v_models import VNet, v_TSN    # add for training with vnet
 from ops.transforms import *
 from opts import parser
 from ops import dataset_config
@@ -68,7 +68,8 @@ def main():
                 fc_lr5=not (args.tune_from and args.dataset in args.tune_from),
                 temporal_pool=args.temporal_pool,
                 non_local=args.non_local)
-    v_model = v_TSN(num_class, args.num_segments, args.modality,
+    # the v_model same as model, only change parent class from nn.Module to MetaModule
+    v_model = v_TSN(num_class, args.num_segments, args.modality,     
                   base_model=args.arch,
                   consensus_type=args.consensus_type,
                   dropout=args.dropout,
@@ -80,7 +81,7 @@ def main():
                       args.tune_from and args.dataset in args.tune_from),
                   temporal_pool=args.temporal_pool,
                   non_local=args.non_local)
-    vnet = VNet(1, 100, 1).cuda()
+    vnet = VNet(1, 100, 1).cuda()   # vnet to predict loss weight
 
     print("getting sizes ...")
     crop_size = model.crop_size
@@ -88,24 +89,24 @@ def main():
     input_mean = model.input_mean
     input_std = model.input_std
     policies = model.get_optim_policies()
-    v_policies = v_model.get_optim_policies()
+    v_policies = v_model.get_optim_policies()   # same as model
     train_augmentation = model.get_augmentation(
         flip=False if 'something' in args.dataset or 'jester' in args.dataset else True)
 
     print("model paralleling ...")
     model = torch.nn.DataParallel(model, device_ids=args.gpus).cuda()
-    v_model = torch.nn.DataParallel(v_model, device_ids=args.gpus).cuda()
+    v_model = torch.nn.DataParallel(v_model, device_ids=args.gpus).cuda()   # also put v_model on gpu
 
     print("building optimizers ...")
     optimizer = torch.optim.SGD(policies,
                                 args.lr,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
-    v_optimizer = torch.optim.SGD(v_policies,
+    v_optimizer = torch.optim.SGD(v_policies,   # optimizer for v_model, same as optimizer for model
                                   args.lr,
                                   momentum=args.momentum,
                                   weight_decay=args.weight_decay)
-    optimizer_vnet = torch.optim.Adam(vnet.params(),
+    optimizer_vnet = torch.optim.Adam(vnet.params(),    # optimizer for vnet
                                       1e-3,
                                       weight_decay=1e-4)
 
@@ -172,7 +173,7 @@ def main():
     elif args.modality in ['Flow', 'RGBDiff']:
         data_length = 5
 
-    train_loader = torch.utils.data.DataLoader(
+    train_loader = torch.utils.data.DataLoader( # DataLoader for train set
         TSNDataSet(args.root_path, args.train_list, num_segments=args.num_segments,
                    new_length=data_length,
                    modality=args.modality,
@@ -189,7 +190,7 @@ def main():
         num_workers=args.workers, pin_memory=True,
         drop_last=True)  # prevent something not % n_GPU
 
-    val_loader = torch.utils.data.DataLoader(
+    val_loader = torch.utils.data.DataLoader(   # DataLoader for test set
         TSNDataSet(args.root_path, args.val_list, num_segments=args.num_segments,
                    new_length=data_length,
                    modality=args.modality,
@@ -211,11 +212,11 @@ def main():
     print("defining loss and optimizer ...")
     if args.loss_type == 'nll':
         criterion = torch.nn.CrossEntropyLoss().cuda()
-        valcriterion = torch.nn.CrossEntropyLoss().cuda()
+        valcriterion = torch.nn.CrossEntropyLoss().cuda()   # criterion for loss on val set
     else:
         raise ValueError("Unknown loss type")
 
-    for group in policies:
+    for group in policies:  # to print policies, not print for v_policies
         print(('group: {} has {} params, lr_mult: {}, decay_mult: {}'.format(
             group['name'], len(group['params']), group['lr_mult'], group['decay_mult'])))
 
@@ -236,13 +237,13 @@ def main():
 
         # train for one epoch
         # train(train_loader, model, criterion, optimizer, epoch, log_training, tf_writer)
-        v_train(train_loader, val_loader,
+        v_train(train_loader, val_loader,   # training with vnet, define at line 271
                 model, v_model, vnet,
                 criterion, valcriterion,
                 optimizer, v_optimizer, optimizer_vnet,
                 epoch, log_training, tf_writer)
 
-        # evaluate on validation set
+        # evaluate on validation set, calculate loss on val set without vnet 
         if (epoch + 1) % args.eval_freq == 0 or epoch == args.epochs - 1:
             prec1 = validate(val_loader, model, criterion,
                              epoch, log_training, tf_writer)
@@ -266,6 +267,7 @@ def main():
             }, is_best)
 
 
+# ref at line 240
 def v_train(train_loader, val_loader,
             model, v_model, vnet,
             criterion, valcriterion,
@@ -314,11 +316,10 @@ def v_train(train_loader, val_loader,
 
         # phase 2. pixel weights step
         try:
-            inputs_val, targets_val = next(val_loader_iter)  # 拿一个val set图片
+            inputs_val, targets_val = next(val_loader_iter)
         except StopIteration:
             val_loader_iter = iter(val_loader)
             inputs_val, targets_val = next(val_loader_iter)
-        # inputs_val, targets_val = sample_val['image'], sample_val['label']
         inputs_val, targets_val = inputs_val.cuda(), targets_val.cuda()
         y_g_hat = v_model(inputs_val)
         l_g_meta = valcriterion(y_g_hat, targets_val)  # val loss
@@ -443,6 +444,7 @@ def train(train_loader, model, criterion, optimizer, epoch, log, tf_writer):
     tf_writer.add_scalar('lr', optimizer.param_groups[-1]['lr'], epoch)
 
 
+# calculate loss without vnet
 def validate(val_loader, model, criterion, epoch, log=None, tf_writer=None):
     batch_time = AverageMeter()
     losses = AverageMeter()
