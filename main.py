@@ -26,6 +26,9 @@ best_prec1 = 0
 args = None
 
 def main():
+    torch.manual_seed(1)
+    torch.cuda.manual_seed_all(1)
+
     global args, best_prec1
     print("parsing args ...")
     args = parser.parse_args()
@@ -82,6 +85,14 @@ def main():
                   non_local=args.non_local)
     vnet = VNet(1, 100, 1).cuda()
 
+    #print(len(v_model.params()))
+    #print(v_model.params()[0])
+    for i, param in enumerate(vnet.params()):
+        print(i, param)
+    #print(vnet.linear1.params())
+    #for name, param in v_model.named_params(v_model):
+    #    print(name,'        ', param.size(), '\n', param)
+    
     print("getting sizes ...")
     crop_size = model.crop_size
     scale_size = model.scale_size
@@ -94,7 +105,7 @@ def main():
 
     print("model paralleling ...")
     model = torch.nn.DataParallel(model, device_ids=args.gpus).cuda()
-    v_model = torch.nn.DataParallel(v_model, device_ids=args.gpus).cuda()
+    #v_model = torch.nn.DataParallel(v_model, device_ids=args.gpus).cuda()
 
     print("building optimizers ...")
     optimizer = torch.optim.SGD(policies,
@@ -156,7 +167,7 @@ def main():
 
     if args.temporal_pool and not args.resume:
         make_temporal_pool(model.module.base_model, args.num_segments)
-        make_temporal_pool(v_model.module.base_model, args.num_segments)
+        make_temporal_pool(v_model.base_model, args.num_segments)
 
     cudnn.benchmark = True
 
@@ -186,7 +197,7 @@ def main():
                        normalize,
                    ]), dense_sample=args.dense_sample),
         batch_size=args.batch_size, shuffle=True,
-        num_workers=args.workers, pin_memory=True,
+        num_workers=args.workers, pin_memory=False,
         drop_last=True)  # prevent something not % n_GPU
 
     val_loader = torch.utils.data.DataLoader(
@@ -205,7 +216,7 @@ def main():
                        normalize,
                    ]), dense_sample=args.dense_sample),
         batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=True)
+        num_workers=args.workers, pin_memory=False)
 
     # define loss function (criterion) and optimizer
     print("defining loss and optimizer ...")
@@ -292,8 +303,9 @@ def v_train(train_loader, val_loader,
         # measure data loading time
         data_time.update(time.time() - end)
 
-        v_model.load_state_dict(model.state_dict())
+        v_model.load_state_dict(model.module.state_dict())
 
+        target_cpu = target
         target = target.cuda()
         input_var = torch.autograd.Variable(input)
         target_var = torch.autograd.Variable(target)
@@ -301,15 +313,16 @@ def v_train(train_loader, val_loader,
         # compute output
         output = v_model(input_var)
         # loss = criterion(output, target_var)
-        cost = criterion(output, target_var)
+        cost = criterion(output, target_cpu)
         cost_v = torch.reshape(cost, (-1, 1))
+        cost_v = cost_v.cuda()
         v_lambda = vnet(cost_v.data)
         l_f_v = torch.sum(cost_v * v_lambda) / len(cost_v)
         v_model.zero_grad()
-        grads = torch.autograd.grad(l_f_v, (v_model.module.params()), create_graph=True)
+        grads = torch.autograd.grad(l_f_v, (v_model.params()), create_graph=True)
         # to be modified
         v_lr = args.lr * ((0.1 ** int(epoch >= 80)) * (0.1 ** int(epoch >= 100)))
-        v_model.module.update_params(lr_inner=v_lr, source_params=grads)
+        v_model.update_params(lr_inner=v_lr, source_params=grads)
         del grads
 
         # phase 2. pixel weights step
@@ -319,7 +332,7 @@ def v_train(train_loader, val_loader,
             val_loader_iter = iter(val_loader)
             inputs_val, targets_val = next(val_loader_iter)
         # inputs_val, targets_val = sample_val['image'], sample_val['label']
-        inputs_val, targets_val = inputs_val.cuda(), targets_val.cuda()
+        # inputs_val, targets_val = inputs_val.cuda(), targets_val.cuda()
         y_g_hat = v_model(inputs_val)
         l_g_meta = valcriterion(y_g_hat, targets_val)  # val loss
         optimizer_vnet.zero_grad()
@@ -328,7 +341,7 @@ def v_train(train_loader, val_loader,
 
         # phase 1. network weight step (w)
         output = model(input_var)
-        cost = criterion(output, target)
+        cost = criterion(output, target_var)
         cost_v = torch.reshape(cost, (-1, 1))
         with torch.no_grad():
             v_new = vnet(cost_v)
@@ -336,7 +349,22 @@ def v_train(train_loader, val_loader,
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        
+        #for name, param in vnet.named_params(curr_module=vnet):
+        #    print(name,'        ', param.size(), '\n', param)
 
+        #if not os.path.exists(os.path.join(args.root_log, args.store_name, 'vnet-params')):
+        #    os.mkdir(os.path.join(args.root_log, args.store_name, 'vnet-params'))
+        #with open(os.path.join(args.root_log, args.store_name, 'vnet-params', 'log.txt'), 'a') as vnet_params_log:
+        #    for name, param in vnet.named_parameters():
+        #        # print(name,'        ', param.size(), '\n', param)
+        #        vnet_params_log.write("In epoch ", epoch, ", Iter ", i, ":\n")
+        #        vnet_params_log.write(name,'        ', param.size(), '\n', param)
+        
+        if i % 50 == 0:
+            for i, param in enumerate(vnet.params()):
+                print(i, param)
+        
         # measure accuracy and record loss
         prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
         losses.update(loss.item(), input.size(0))
@@ -533,7 +561,6 @@ def check_rootfolders():
         if not os.path.exists(folder):
             print('creating folder ' + folder)
             os.mkdir(folder)
-
 
 if __name__ == '__main__':
     main()

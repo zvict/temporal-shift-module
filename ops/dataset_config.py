@@ -5,7 +5,7 @@
 
 import os
 
-ROOT_DATASET = '/zys-volume/vTSM/dataset/something-something-v2/'  # '/data/jilin/'
+ROOT_DATASET = '/zys-volume/vTSM-full/dataset/something-something-v2/'  # '/data/jilin/'
 
 
 def return_ucf101(modality):
